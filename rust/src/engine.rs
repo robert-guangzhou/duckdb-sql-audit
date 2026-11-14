@@ -627,7 +627,7 @@ pub fn now_ms() -> i64 {
 }
 
 /// Minimal JWT claims decoder: `header.payload.signature` -> payload JSON.
-/// base64url without padding, hand-rolled (no new dependency, plan §八).
+/// base64url without padding, hand-rolled (no new dependency, plan §8).
 /// Any malformed input returns None — the audit side path must never panic
 /// or block the connection flow.
 fn decode_jwt_claims(token: &str) -> Option<serde_json::Value> {

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """P4-4 INTEGRATION TEST — TP-26..34 (executable subset, real Keycloak).
 
-Honest scope statement (实现即事实, plan r18/r25):
+Honest scope statement (implementation-as-fact, plan r18/r25):
   * secret_vault extension is NOT available on this host (no build, not
     installed) — TP-30's secret_vault assertions are SKIPped, not faked.
   * quack wire-protocol serving (ATTACH serve) is not exercised here: the
@@ -346,7 +346,7 @@ verdict("TC-02-forged", r02.get("reason") in ("unknown_kid", "jwks_throttled")
         and r02.get("verdict") == "reject",
         "forged-sig reason=%r (authoritative enum: unknown_kid|jwks_throttled)" % r02.get("reason"))
 # TC-05b: multi-byte sub must respect the BYTE budget (<=256B, char-safe cut)
-_mb_claims = {"sub": "密" * 300, "exp": int(time.time()) + 600}  # 300 CJK chars = 900B
+_mb_claims = {"sub": "\u5bc6" * 300, "exp": int(time.time()) + 600}  # 300 CJK chars = 900B
 _jmb = _b64u(b'{"alg":"RS256"}') + "." + _b64u(json.dumps(_mb_claims, ensure_ascii=False).encode()) + "." + "A" * 43
 c32.execute("SELECT sql_audit_authn_chain('tc05b', ?, 'psk')", [_jmb])
 time.sleep(0.5)

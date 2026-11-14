@@ -329,7 +329,7 @@ static unique_ptr<GlobalTableFunctionState> HealthInit(ClientContext &, TableFun
 }
 static void HealthFn(ClientContext &ctx, TableFunctionInput &data, DataChunk &output) {
     // P4-3: health polling is the auto-rechain check point (r7 design:
-    // "health 持续校验钩子现值") — monitoring polls health, hooks converge
+    // "health continuously validates the current hook values") — monitoring polls health, hooks converge
     // on every call. Covers both "hook overwritten" and "quack loaded after
     // us" (initial takeover happens here when LOAD-time takeover was skipped).
     if (g_strict_set_ok) {
