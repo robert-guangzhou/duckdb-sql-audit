@@ -270,3 +270,4 @@ pub extern "C" fn sql_audit_set_key_file(path: *const u8, path_len: i64) -> i32 
 pub extern "C" fn sql_audit_set_nats_confirm(on: i32) -> i32 {
     if let Some(eng) = ENGINE.get() { eng.set_nats_confirm(on != 0); 0 } else { -1 }
 }
+
