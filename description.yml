@@ -1,0 +1,75 @@
+extension:
+  name: sql_audit
+  description: "Full-statement SQL auditing with a tamper-evident hash chain: HMAC-chained STMT/CONN/SYS records to local rotating JSONL and/or NATS, client attribution via quack hook takeover with faithful delegation and auto-rechain"
+  version: 0.1.0
+  language: C++
+  build: cmake
+  license: BSL 1.1
+  excluded_platforms: "linux_amd64_musl;linux_arm64;osx_amd64;osx_arm64;wasm_mvp;wasm_eh;wasm_threads;windows_amd64;windows_amd64_mingw;windows_amd64_rtools"
+  requires_toolchains: rust
+  maintainers:
+    - robert-guangzhou
+
+repo:
+  github: robert-guangzhou/duckdb-sql-audit
+  ref: main
+
+docs:
+  hello_world: |
+    INSTALL sql_audit FROM community;
+    LOAD sql_audit;
+
+    -- STRICT parser mode and quack hook takeover happen at LOAD.
+    -- Every statement is now captured into a hash chain on disk:
+    SELECT 42;
+
+    SELECT * FROM sql_audit_health();
+    -- captured | dropped | pending | records | files | halted | nats_pub | nats_err | conns | conn_rejects | hook_state | authn_delegate | authz_delegate
+
+    SELECT * FROM sql_audit_verify();
+    -- ok | first_bad_seq | total_records | chain_head | window_start_seq
+    -- true, 0, 3, <hmac>, 1
+
+  extended_description: |
+    sql_audit records every statement DuckDB parses (DDL/DML/SELECT/SET/TX/
+    EXPLAIN/PRAGMA) via the `parser_override` hook — strictly pass-through,
+    zero semantic change — into an append-only, tamper-evident audit log:
+
+    - **Hash chain**: each record is a link —
+      `entry_hmac = HMAC-SHA256(key, seq|ts|type|principal|verdict|hash_field|prev_hash)`.
+      `sql_audit_verify()` walks the chain and reports the first bad seq;
+      splicing (delete a record + rewire `prev_hash`) is detected because
+      `prev_hash` is inside the HMAC. Retention-pruned histories verify with
+      retained-window semantics (`window_start_seq` exposes the head gap).
+    - **Record kinds**: STMT (full query text, never truncated),
+      CONN (connection open/reject with token fingerprint, authoritative
+      rejection reason via quack_oauth's audit log, self-reported `sub`
+      capped at 256 bytes with a full-text hash, and `azp`), and SYS
+      (hook takeover / rechain events).
+    - **Sinks**: local rotating JSONL (size/retention configurable,
+      `prune` or `halt` policy, 0700/0600 permissions, torn-tail recovery)
+      and/or NATS (`local|nats|both|off`), with transparent segmentation of
+      oversize payloads under the server's `max_payload`, a 5s reconnect
+      cooldown that never stalls the writer, optional per-publish
+      PING/PONG confirmation, and periodic chain-head anchor messages for
+      cross-end tamper evidence.
+    - **Multi-process safe**: writers take a per-directory flock and rebase
+      onto the disk tail — concurrent sessions on one audit dir keep the
+      chain linear.
+    - **quack integration**: LOAD takes over `quack_authentication_function`
+      / `quack_authorization_function`; the previous functions become
+      delegates with faithful semantics (authn deny, authz rewrite, errors
+      propagate). If the hooks are later overwritten (e.g. following the
+      quack_oauth README), the next health poll re-takes them, adopts the
+      new function as delegate and writes a `rehook` SYS event into the chain.
+    - **Chain key**: by default inside the audit dir; can be externalized
+      (`sql_audit_key_file`) to a different mount or vault export.
+
+    Known boundaries (by design, see README): a root attacker with the chain
+    key can recompute the chain — mitigate with an externalized key and NATS
+    anchors; a power-loss-torn last record is only detectable cross-end
+    (tools/sql_audit_sub.py `--reconcile`); C08-C12 connection fields
+    (client ip/host, version/platform) need upstream quack callback changes.
+
+    Tests: 64-case main suite + 26-case real-Keycloak integration suite in
+    the repo's `tests/` directory.
