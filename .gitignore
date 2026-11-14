@@ -1,0 +1,9 @@
+build/
+.cache/
+duckdb/
+extension-ci-tools/
+rust/target/
+src/libsql_audit.a
+*.duckdb_extension
+attic/
+__pycache__/
