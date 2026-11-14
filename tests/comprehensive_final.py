@@ -2,9 +2,13 @@
 """sql_audit COMPREHENSIVE FINAL TEST — Phase 1+2+3+4, all groups"""
 import duckdb, os, time, json, sys, shutil
 
-EXT = "/home/xiehq/quack-verify/duckdb-sql-audit/build/release/extension/sql_audit/sql_audit.duckdb_extension"
-ACL = "/home/xiehq/quack-verify/build/duckdb-acl/build/release/extension/acl/acl.duckdb_extension"
-AUDIT_DIR = "/root/.duckdb/sql_audit"
+# Environment-parameterized paths (multiplatform): minis defaults preserved;
+# on other hosts inject SQL_AUDIT_EXT / SQL_AUDIT_ACL / SQL_AUDIT_DIR.
+EXT = os.environ.get("SQL_AUDIT_EXT",
+    "/home/xiehq/quack-verify/duckdb-sql-audit/build/release/extension/sql_audit/sql_audit.duckdb_extension")
+ACL = os.environ.get("SQL_AUDIT_ACL",
+    "/home/xiehq/quack-verify/build/duckdb-acl/build/release/extension/acl/acl.duckdb_extension")
+AUDIT_DIR = os.environ.get("SQL_AUDIT_DIR", "/root/.duckdb/sql_audit")
 
 R = {}
 def verdict(tid, ok, note):

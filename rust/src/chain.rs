@@ -36,20 +36,11 @@ impl ChainKey {
             }
             Ok(Self { key })
         } else {
-            // Generate random key
+            // Generate random key via the OS RNG (getrandom: getrandom(2) on
+            // Linux, ProcessPrng/BCrypt on Windows). The old time+pid hash
+            // fallback was weak entropy on Windows — predictable keys.
             let mut key = vec![0u8; 32];
-            // Use /dev/urandom on Linux
-            if let Ok(mut f) = fs::File::open("/dev/urandom") {
-                use std::io::Read;
-                f.read_exact(&mut key).map_err(|e| format!("urandom: {}", e))?;
-            } else {
-                // Fallback: hash of time + pid
-                let mut hasher = Sha256::new();
-                hasher.update(format!("{}:{}", std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos(),
-                    std::process::id()).as_bytes());
-                key = hasher.finalize().to_vec();
-            }
+            getrandom::getrandom(&mut key).map_err(|e| format!("os rng: {}", e))?;
             // Write with 0600 permissions
             #[cfg(unix)]
             {

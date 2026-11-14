@@ -79,12 +79,42 @@ impl DirLock {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+impl DirLock {
+    pub fn acquire(dir: &Path) -> Option<DirLock> {
+        use std::os::windows::io::AsRawHandle;
+        const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x0000_0002;
+        let path = dir.join(".lock");
+        // plain write handle: append-only handles (FILE_APPEND_DATA) get
+        // ERROR_ACCESS_DENIED from LockFileEx (proven: probe GetLastError=5)
+        let file = OpenOptions::new().create(true).write(true).open(&path).ok()?;
+        let handle = file.as_raw_handle() as isize; // windows-sys HANDLE = isize
+        // LockFileEx (exclusive, blocking): kernel-released on process death,
+        // semantics equivalent to flock(LOCK_EX). Lock byte range [0, 1).
+        let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::LockFileEx(
+                handle,
+                LOCKFILE_EXCLUSIVE_LOCK,
+                0,
+                1,
+                0,
+                &mut overlapped,
+            )
+        };
+        if ok != 0 {
+            Some(DirLock { _file: file })
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 impl DirLock {
     pub fn acquire(_dir: &Path) -> Option<DirLock> {
-        // Non-unix hosts: single-process assumption, no cross-process lock
-        let file = File::create(std::path::Path::new("/dev/null")).ok()?;
-        Some(DirLock { _file: file })
+        // No other targets are in the supported platform set
+        None
     }
 }
 

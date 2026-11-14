@@ -40,7 +40,12 @@ pub struct EngineConfig {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
-            output_dir: format!("{}/.duckdb/sql_audit", std::env::var("HOME").unwrap_or_default()),
+            // HOME is usually unset on Windows - fall back to USERPROFILE so the
+            // audit dir does not land in the filesystem root.
+            output_dir: format!("{}/.duckdb/sql_audit",
+                std::env::var("HOME")
+                    .or_else(|_| std::env::var("USERPROFILE"))
+                    .unwrap_or_default()),
             max_file_mb: 64, retention_files: 32,
             retention_policy: RetentionPolicy::Prune,
             principal: String::new(),

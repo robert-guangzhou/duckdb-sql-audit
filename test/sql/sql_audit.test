@@ -1,0 +1,58 @@
+# sql_audit offline smoke test (zero-env: no NATS, no Keycloak, no env vars).
+# CI-safe by design (D8): runs in every environment the community CI offers.
+#
+# D11 note: the sqllogictest runner re-points HOME/USERPROFILE per run, so the
+# audit dir is pinned explicitly below instead of relying on the default path.
+# The assertions are idempotent across re-runs (>= / set-membership, never
+# exact counters).
+
+require sql_audit
+
+load sql_audit
+
+# Pin the audit dir to a repo-relative path (runner CWD = repository root).
+statement ok
+SET GLOBAL sql_audit_path='sql_audit_test_dir'
+
+# Exercise several statement classes through the parser override.
+statement ok
+CREATE TABLE mp_t(a INT)
+
+statement ok
+INSERT INTO mp_t VALUES (1),(2)
+
+statement ok
+SELECT 41+1
+
+# Capture counter is parser-level and synchronous (stable across runners).
+# (pending is async-drained: not asserted here - timing-dependent.)
+query I
+SELECT captured >= 5 FROM sql_audit_health()
+----
+1
+
+query I
+SELECT count(*) FROM mp_t
+----
+2
+
+# The hash chain must verify after mixed statements.
+query I
+SELECT ok FROM sql_audit_verify()
+----
+true
+
+# window_start_seq column exists and is a plausible seq (>=1).
+query I
+SELECT window_start_seq >= 1 FROM sql_audit_verify()
+----
+true
+
+statement ok
+DROP TABLE mp_t
+
+# Chain still intact after the DDL teardown.
+query I
+SELECT ok FROM sql_audit_verify()
+----
+true
