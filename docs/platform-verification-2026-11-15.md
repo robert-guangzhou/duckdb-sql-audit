@@ -1,7 +1,7 @@
 ---
 name: platform-verification-2026-11-15
 type: verification-matrix
-status: active
+status: complete
 date: 2026-11-15
 parent-plan: sql-audit-multiplatform-plan.md
 ---
@@ -17,7 +17,16 @@ parent-plan: sql-audit-multiplatform-plan.md
 |------|------|-----------|----------|--------------|------|---------|------|----------|
 | linux_amd64 | ✅ 已验证（基线） | 0 | ELF x86-64 | ✓ | 主套件 64/64 + 集成 26 + 离线 10 | ✓ | — | minis build/release + build/ut |
 | windows_amd64 | ✅ 已验证（阶段 1） | 0 | PE32+ x86-64 (DLL) | ✓ | 离线 10 + 核心 G1-G3 17/19* | ✓ | MP-05/06/07 全 PASS | .runtime/win-*.log + 本文档 |
-| linux_arm64 | ⏳ 构建中（阶段 2） | — | — | — | — | — | — | tmp/arm64-build.log（QEMU 后台） |
+| linux_arm64 | ✅ 已验证（阶段 2） | 0（增量重试后 252/252） | ELF aarch64 (shared object) | ✓ | 离线 10 断言全绿 | ✓ | — | tmp/arm64-ninja2.log + 本行 |
+
+### arm64 构建过程记录（三坑入档）
+
+| 尝试 | 坑 | 处置 |
+|------|-----|------|
+| #1 | rust/target 混有 x86 宿主机产物 → QEMU 混合架构死锁（7h 冻结 CPU 0%） | `CARGO_TARGET_DIR=/tmp/rgt` 容器内隔离 → 4 分钟编完 |
+| #2 | 忘装 cmake | apt 装齐 |
+| #3 | `cmake --build \| tail -5` 管道吞退出码（假绿变体）+ cc1plus 偶发段错误（手册已知） | 无管道全量日志 + 显式 `$?`；段错误按手册增量重试即过 |
+| #4（成功） | -j4 + ulimit -s unlimited | 252/252 exit 0 零失败 |
 
 \* G1-G3 的 2 个 FAIL 均为固定 sleep 排水时序（Windows 消费者较慢），经排空感知探针（poll-until-halted）逐一复验：halt 语义正确（halted=True + SQL 继续 + verify ok）、prune+window 语义正确。**非产品缺陷，不阻塞平台启用。**
 
