@@ -17,7 +17,7 @@ parent-plan: sql-audit-multiplatform-plan.md
 |------|------|-----------|----------|--------------|------|---------|------|----------|
 | linux_amd64 | ✅ 已验证（基线） | 0 | ELF x86-64 | ✓ | 主套件 64/64 + 集成 26 + 离线 10 | ✓ | — | minis build/release + build/ut |
 | windows_amd64 | ✅ 已验证（阶段 1） | 0 | PE32+ x86-64 (DLL) | ✓ | 离线 10 + 核心 G1-G3 17/19* | ✓ | MP-05/06/07 全 PASS | .runtime/win-*.log + 本文档 |
-| linux_arm64 | ✅ 已验证（阶段 2） | 0（增量重试后 252/252） | ELF aarch64 (shared object) | ✓ | 离线 10 断言全绿 | ✓ | — | tmp/arm64-ninja2.log + 本行 |
+| linux_arm64 | ✅ 已验证（阶段 2 + corrosion 复验） | 0（扩展 5 次重试后；unittest 同） | ELF aarch64 (shared object) | ✓ | 离线 10 断言全绿（corrosion 版） | ✓ | corrosion: target 钉死 aarch64 + cargo 1m19s | tmp/arm64-ninja2.log + armcorr-ninja*.log |
 
 ### arm64 构建过程记录（三坑入档）
 
