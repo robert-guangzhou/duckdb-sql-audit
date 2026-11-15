@@ -163,19 +163,33 @@ static void CheckAndRechain(DatabaseInstance &db, const char *setting,
 //   audit information (the attributed record is produced INSIDE the chain
 //   function). A user's literal call `SELECT sql_audit_authz_chain('c','q')`
 //   is a normal statement and IS audited.
+// Hot path: zero heap allocations — the old Lower() copy added ~17us at p99
+// (interleaved benchmark, acceptance gate is <5us).
+static inline bool DispatchPrefixAt(const char *s, size_t n, size_t pos,
+                                    const char *pre, size_t plen) {
+    if (pos + plen > n) return false;
+    for (size_t i = 0; i < plen; i++) {
+        char c = s[pos + i];
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+        if (c != pre[i]) return false;
+    }
+    return true;
+}
 static ParserOverrideResult AuditOverride(ParserExtensionInfo *, const string &query, ParserOptions &) {
     g_override_calls.fetch_add(1, std::memory_order_relaxed);
     if (g_in_chain) return ParserOverrideResult();
-    string q = StringUtil::Lower(query);
-    size_t lead = q.find_first_not_of(" \t\r\n");
-    if (lead == string::npos) return ParserOverrideResult();
-    static const string kDispatchA = "select sql_audit_authn_chain(?, ?";
-    static const string kDispatchZ = "select sql_audit_authz_chain(?, ?";
-    if (q.compare(lead, kDispatchA.size(), kDispatchA) == 0 ||
-        q.compare(lead, kDispatchZ.size(), kDispatchZ) == 0) {
+    const char *s = query.c_str();
+    size_t n = query.size();
+    size_t lead = 0;
+    while (lead < n && (s[lead] == ' ' || s[lead] == '\t' || s[lead] == '\r' || s[lead] == '\n')) lead++;
+    if (lead >= n) return ParserOverrideResult();
+    static const char kDispatchA[] = "select sql_audit_authn_chain(?, ?";
+    static const char kDispatchZ[] = "select sql_audit_authz_chain(?, ?";
+    if (DispatchPrefixAt(s, n, lead, kDispatchA, sizeof(kDispatchA) - 1) ||
+        DispatchPrefixAt(s, n, lead, kDispatchZ, sizeof(kDispatchZ) - 1)) {
         return ParserOverrideResult();
     }
-    sql_audit_capture(query.c_str(), (int64_t)query.size());
+    sql_audit_capture(query.c_str(), (int64_t)n);
     return ParserOverrideResult();
 }
 
@@ -488,10 +502,11 @@ static void LoadInternal(ExtensionLoader &loader) {
     authz_chain.SetVolatile();
     loader.RegisterFunction(authz_chain);
 
-    // P4-3: manual re-hook
+// P4-3: manual re-hook
     ScalarFunction rehook_fn("sql_audit_rehook", {}, LogicalType::BOOLEAN, RehookFunction);
     rehook_fn.SetVolatile();
     loader.RegisterFunction(rehook_fn);
+
 
     // Register parser override
     auto &callbacks = ExtensionCallbackManager::Get(db);

@@ -39,6 +39,7 @@ int32_t sql_audit_get_hook_state(void); // 0=not-hooked, 1=hooked, 2=overridden
 int32_t sql_audit_sys_event(const char* event_type, int64_t type_len,
                             const char* detail, int64_t detail_len);
 int32_t sql_audit_conn_reject_add(void);
+
 // LOW-fix batch (r24): key externalization + NATS confirmation
 int32_t sql_audit_set_key_file(const char* path, int64_t path_len);
 int32_t sql_audit_set_nats_confirm(int32_t on);

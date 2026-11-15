@@ -59,6 +59,11 @@ pub extern "C" fn sql_audit_shutdown() {
 pub extern "C" fn sql_audit_capture(query_data: *const u8, query_len: i64) -> SqlAuditVerdict {
     let result = std::panic::catch_unwind(|| {
         if !INITIALIZED.load(Ordering::SeqCst) { return; }
+        // Test hook (acceptance 5: panic containment): env-gated, panics
+        // INSIDE the catch_unwind so the C boundary is never crossed.
+        if std::env::var("SQL_AUDIT_INJECT_PANIC").as_deref() == Ok("1") {
+            panic!("injected: capture path");
+        }
         let slice = unsafe { std::slice::from_raw_parts(query_data, query_len as usize) };
         let msg = engine::CaptureMsg::new(slice);
         if let Some((tx, _)) = CHANNEL.get() {
