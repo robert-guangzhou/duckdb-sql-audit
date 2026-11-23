@@ -47,12 +47,14 @@ docs:
       capped at 256 bytes with a full-text hash, and `azp`), and SYS
       (hook takeover / rechain events).
     - **Sinks**: local rotating JSONL (size/retention configurable,
-      `prune` or `halt` policy, 0700/0600 permissions, torn-tail recovery)
-      and/or NATS (`local|nats|both|off`), with transparent segmentation of
-      oversize payloads under the server's `max_payload`, a 5s reconnect
-      cooldown that never stalls the writer, optional per-publish
-      PING/PONG confirmation, and periodic chain-head anchor messages for
-      cross-end tamper evidence.
+      `prune` or `halt` policy, disk watermark guard, 0700/0600
+      permissions, torn-tail recovery) and/or NATS (`local|nats|both|off`),
+      with transparent segmentation of oversize payloads under the server's
+      `max_payload`, a 5s reconnect cooldown that never stalls the writer,
+      optional per-publish PING/PONG confirmation, and periodic chain-head
+      anchor messages for cross-end tamper evidence. NATS auth via
+      `CREATE SECRET (TYPE sql_audit_nats, ...)`: token, user/password,
+      NKey, or JWT/creds file (nats_rw-compatible six-param surface).
     - **Multi-process safe**: writers take a per-directory flock and rebase
       onto the disk tail — concurrent sessions on one audit dir keep the
       chain linear.

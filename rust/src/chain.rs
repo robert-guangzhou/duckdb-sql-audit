@@ -1,7 +1,7 @@
 use hmac::{Hmac, Mac};
 use sha2::{Sha256, Digest};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::io::Write;
 
 pub struct ChainKey {
@@ -165,16 +165,4 @@ pub fn sha256_hex(data: &[u8]) -> String {
 
 pub fn hex_encode(data: &[u8]) -> String {
     data.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-/// SHA-512 hash (needed for ed25519 nonce signing in sink_nats).
-/// Self-contained implementation using sha2's Sha512.
-pub fn sha512_bytes(data: &[u8]) -> [u8; 64] {
-    use sha2::Sha512;
-    let mut hasher = Sha512::new();
-    hasher.update(data);
-    let result = hasher.finalize();
-    let mut out = [0u8; 64];
-    out.copy_from_slice(&result);
-    out
 }

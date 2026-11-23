@@ -70,11 +70,30 @@ SELECT sql_audit_rehook();          -- manual hook recovery
 | `sql_audit_max_file_mb` | 64 | rotation size |
 | `sql_audit_retention_files` | 32 | max audit files |
 | `sql_audit_retention_policy` | `prune` | `prune` (delete oldest) or `halt` (stop writing, SQL continues) |
+| `sql_audit_disk_free_pct` | 5 | stop writing when disk free % drops below this (0 = disabled; releases halt when set to 0) |
 | `sql_audit_mode` | `local` | `local` / `nats` / `both` / `off` |
 | `sql_audit_nats_url` | *(empty)* | e.g. `nats://host:4222` |
 | `sql_audit_nats_subject` | `sqlaudit` | record subject; anchors on `<subject>.anchor` |
+| `sql_audit_nats_secret_name` | *(empty)* | name of a `sql_audit_nats` SECRET with credentials (falls back to bare URL) |
 | `sql_audit_nats_confirm` | false | PING/PONG ack per publish |
 | `sql_audit_auto_hook` | true | auto re-take quack hooks when overwritten |
+
+### NATS authentication (SECRET)
+
+```sql
+-- Create credentials (nats_rw-compatible six-param surface, pick ONE auth method)
+CREATE SECRET my_nats (
+    TYPE sql_audit_nats,
+    URL 'nats://localhost:4222',
+    TOKEN 'my-token'              -- or: USER 'alice', PASSWORD 's3cret'
+                                 -- or: NKEY 'SU...' (seed)
+                                 -- or: CREDS '/path/to/file.creds' (JWT + seed)
+);
+
+-- Apply the secret
+SET sql_audit_nats_secret_name = 'my_nats';
+SET sql_audit_mode = 'both';
+```
 
 ### Record schema (v5)
 
