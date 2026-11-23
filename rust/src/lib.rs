@@ -276,3 +276,45 @@ pub extern "C" fn sql_audit_set_nats_confirm(on: i32) -> i32 {
     if let Some(eng) = ENGINE.get() { eng.set_nats_confirm(on != 0); 0 } else { -1 }
 }
 
+
+// SECRET six-param surface + disk guard (r30)
+#[no_mangle]
+pub extern "C" fn sql_audit_set_nats_auth(
+    url: *const u8, url_len: i64,
+    user: *const u8, user_len: i64,
+    password: *const u8, password_len: i64,
+    token: *const u8, token_len: i64,
+    nkey: *const u8, nkey_len: i64,
+    creds: *const u8, creds_len: i64,
+    subject: *const u8, subject_len: i64,
+) -> i32 {
+    let result = std::panic::catch_unwind(|| {
+        let eng = match ENGINE.get() { Some(e) => e, None => return -1 };
+        let s = |p: *const u8, l: i64| unsafe {
+            if p.is_null() || l == 0 { String::new() }
+            else { std::str::from_utf8_unchecked(std::slice::from_raw_parts(p, l as usize)).to_string() }
+        };
+        eng.set_nats_auth(
+            &s(url, url_len), &s(user, user_len), &s(password, password_len),
+            &s(token, token_len), &s(nkey, nkey_len), &s(creds, creds_len),
+            &s(subject, subject_len),
+        )
+    });
+    match result { Ok(r) => r, Err(_) => -1 }
+}
+
+#[no_mangle]
+pub extern "C" fn sql_audit_set_disk_free_pct(pct: i64) -> i32 {
+    if let Some(eng) = ENGINE.get() { eng.set_disk_free_pct(pct); 0 } else { -1 }
+}
+
+/// Check disk free space on the audit dir (returns pct free, or -1 on error)
+#[no_mangle]
+pub extern "C" fn sql_audit_get_disk_free_pct() -> i64 {
+    if let Some(eng) = ENGINE.get() {
+        match eng.get_disk_free_pct() {
+            Some(p) => p as i64,
+            None => -1,
+        }
+    } else { -1 }
+}

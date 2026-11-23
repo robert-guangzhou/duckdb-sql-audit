@@ -66,6 +66,10 @@ pub struct AuditEngine {
     anchor_counter: Arc<Mutex<u64>>,
     conn_counter: Arc<Mutex<u64>>,
     conn_reject_counter: Arc<Mutex<u64>>,
+    /// NATS auth credentials (set via SECRET, used on reconnect)
+    auth_creds: Arc<Mutex<Option<crate::sink_nats::NatsAuth>>>,
+    /// Disk watermark guard: stop writing below this pct free (None=off)
+    disk_free_pct: Arc<Mutex<Option<i64>>>,
 }
 
 impl AuditEngine {
@@ -101,6 +105,8 @@ impl AuditEngine {
             anchor_counter: Arc::new(Mutex::new(0)),
             conn_counter: Arc::new(Mutex::new(0)),
             conn_reject_counter: Arc::new(Mutex::new(0)),
+            auth_creds: Arc::new(Mutex::new(None)),
+            disk_free_pct: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -110,6 +116,7 @@ impl AuditEngine {
             sink: self.sink.clone(), nats_sink: self.nats_sink.clone(),
             record_count: self.record_count.clone(), anchor_counter: self.anchor_counter.clone(),
             conn_counter: self.conn_counter.clone(), conn_reject_counter: self.conn_reject_counter.clone(),
+            auth_creds: self.auth_creds.clone(), disk_free_pct: self.disk_free_pct.clone(),
         }
     }
 
@@ -220,7 +227,8 @@ impl AuditEngine {
             (cfg.nats_url.clone(), cfg.nats_subject.clone(), cfg.nats_confirm)
         };
         if url.is_empty() { return; }
-        match NatsSink::new(NatsSinkConfig { url, subject: subj, confirm, ..Default::default() }) {
+        let auth = self.auth_creds.lock().unwrap().clone();
+        match NatsSink::new(NatsSinkConfig { url, subject: subj, confirm, auth, ..Default::default() }) {
             Ok(n) => { *self.nats_sink.lock().unwrap() = Some(n); }
             Err(e) => { eprintln!("sql_audit: NATS reconnect failed: {}", e); *self.nats_sink.lock().unwrap() = None; }
         }
@@ -560,6 +568,61 @@ impl AuditEngine {
     pub fn conn_count(&self) -> i64 { *self.conn_counter.lock().unwrap() as i64 }
     pub fn conn_reject_count(&self) -> i64 { *self.conn_reject_counter.lock().unwrap() as i64 }
 
+    /// SECRET six-param auth: build NatsAuth and reconnect.
+    pub fn set_nats_auth(&self, url: &str, user: &str, password: &str,
+                          token: &str, nkey: &str, creds: &str, subject: &str) -> i32 {
+        {
+            let mut cfg = self.config.lock().unwrap();
+            if !url.is_empty() { cfg.nats_url = url.to_string(); }
+            if !subject.is_empty() { cfg.nats_subject = subject.to_string(); }
+        }
+        let auth = if !token.is_empty() {
+            Some(crate::sink_nats::NatsAuth::Token(token.to_string()))
+        } else if !user.is_empty() && !password.is_empty() {
+            Some(crate::sink_nats::NatsAuth::UserPass {
+                user: user.to_string(), pass: password.to_string(),
+            })
+        } else if !nkey.is_empty() {
+            Some(crate::sink_nats::NatsAuth::NKey { seed: nkey.to_string() })
+        } else if !creds.is_empty() {
+            match parse_creds_file(creds) {
+                Ok((jwt, seed)) => Some(crate::sink_nats::NatsAuth::Creds { jwt, seed }),
+                Err(e) => { eprintln!("sql_audit: creds parse: {}", e); return -1; }
+            }
+        } else {
+            None
+        };
+        *self.auth_creds.lock().unwrap() = auth;
+        // Credential change: drop old sink (bypasses cooldown) and reconnect now
+        *self.nats_sink.lock().unwrap() = None;
+        self.reconnect_nats();
+        0
+    }
+
+    /// Disk watermark guard threshold (0 = disabled)
+    pub fn set_disk_free_pct(&self, pct: i64) {
+        let val = if pct == 0 { None } else { Some(pct) };
+        *self.disk_free_pct.lock().unwrap() = val;
+        // Propagate to the local sink (rotate() checks this field);
+        // disabling the guard also releases a disk-guard halt
+        let mut sink_g = self.sink.lock().unwrap();
+        if let Some(s) = sink_g.as_mut() {
+            s.set_disk_free_pct(val);
+            if val.is_none() {
+                s.set_disk_guard_released();
+            }
+        }
+    }
+
+    /// Check free disk space percentage on the audit dir
+    pub fn get_disk_free_pct(&self) -> Option<u64> {
+        let dir = {
+            let sink_g = self.sink.lock().unwrap();
+            sink_g.as_ref().map(|s| s.dir().to_path_buf())?
+        };
+        disk_free_percent(&dir)
+    }
+
     /// System event (hook takeover / rechain / config change): SYS record,
     /// hash field = sha256(detail) so the event text is tamper-covered.
     pub fn sys_event(&self, event_type: &str, detail: &str) {
@@ -670,4 +733,61 @@ fn base64url_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// Parse a NATS credentials file (.creds): extract JWT and NKey seed.
+/// Format: comment blocks with `-----BEGIN NATS JWT-----` and `-----BEGIN USER NKEY SEED-----`
+fn parse_creds_file(path: &str) -> Result<(String, String), String> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| format!("read {}: {}", path, e))?;
+    let mut jwt = String::new();
+    let mut seed = String::new();
+    let mut in_jwt = false;
+    let mut in_seed = false;
+    for line in content.lines() {
+        let l = line.trim();
+        if l.contains("BEGIN NATS JWT") { in_jwt = true; continue; }
+        if l.contains("END NATS JWT") { in_jwt = false; continue; }
+        if l.contains("BEGIN USER NKEY SEED") || l.contains("BEGIN PRIVATE KEY") { in_seed = true; continue; }
+        if l.contains("END USER NKEY SEED") || l.contains("END PRIVATE KEY") { in_seed = false; continue; }
+        if l.starts_with("}") { in_jwt = false; in_seed = false; continue; }
+        if in_jwt && !l.starts_with("/*") && !l.starts_with("//") && !l.is_empty() {
+            jwt.push_str(l);
+        }
+        if in_seed && !l.starts_with("/*") && !l.starts_with("//") && !l.is_empty() {
+            seed.push_str(l);
+        }
+    }
+    if jwt.is_empty() || seed.is_empty() {
+        return Err("creds file missing JWT or seed".to_string());
+    }
+    Ok((jwt, seed))
+}
+
+/// Check free disk space percentage (0-100) on the given directory
+#[cfg(unix)]
+fn disk_free_percent(dir: &std::path::Path) -> Option<u64> {
+    use std::ffi::CString;
+    let c_path = CString::new(dir.to_str()?).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if rc != 0 { return None; }
+    if stat.f_blocks == 0 { return None; }
+    let free = stat.f_bavail as u64;
+    let total = stat.f_blocks as u64;
+    Some((free * 100) / total)
+}
+
+#[cfg(windows)]
+fn disk_free_percent(dir: &std::path::Path) -> Option<u64> {
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let wide: Vec<u16> = dir.to_str()?.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut free: u64 = 0;
+    let mut total: u64 = 0;
+    let mut _total_free: u64 = 0;
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, &mut _total_free)
+    };
+    if ok == 0 || total == 0 { return None; }
+    Some((free * 100) / total)
 }

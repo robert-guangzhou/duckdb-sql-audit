@@ -131,6 +131,8 @@ pub struct LocalSink {
     pub(crate) retention_files: usize,
     pub(crate) retention_policy: RetentionPolicy,
     pub(crate) halted: bool,
+    /// Disk watermark guard: stop writing when free space < this pct (None=off)
+    pub(crate) disk_free_pct: Option<i64>,
     current_file: Option<BufWriter<File>>,
     current_path: PathBuf,
     current_size: u64,
@@ -210,6 +212,7 @@ impl LocalSink {
             retention_files: config.retention_files,
             retention_policy: config.retention_policy,
             halted: false,
+            disk_free_pct: None,
             current_file: Some(BufWriter::new(file)),
             current_path: path, current_size: size, file_counter: counter,
         })
@@ -228,6 +231,16 @@ impl LocalSink {
     pub fn set_retention_policy(&mut self, policy: RetentionPolicy) {
         self.retention_policy = policy;
         if policy == RetentionPolicy::Prune { self.halted = false; }
+    }
+
+    pub fn set_disk_free_pct(&mut self, pct: Option<i64>) {
+        self.disk_free_pct = pct;
+    }
+
+    /// Release a disk-guard halt (separate from retention release so causes
+    /// can be distinguished if needed later)
+    pub fn set_disk_guard_released(&mut self) {
+        self.halted = false;
     }
 
     pub fn is_halted(&self) -> bool { self.halted }
@@ -267,6 +280,17 @@ impl LocalSink {
         if let Some(mut w) = self.current_file.take() {
             let _ = w.flush();
             let _ = w.get_ref().sync_all();
+        }
+        // Disk watermark guard: stop writing if free space below threshold
+        if let Some(min_pct) = self.disk_free_pct {
+            if let Some(free_pct) = disk_free_percent_dir(&self.dir) {
+                if (free_pct as i64) < min_pct {
+                    self.halted = true;
+                    eprintln!("sql_audit: disk guard (free={}%, threshold={}%) — audit halted, SQL continues",
+                              free_pct, min_pct);
+                    return;
+                }
+            }
         }
         // Prune old files if policy is Prune
         if self.retention_policy == RetentionPolicy::Prune {
@@ -411,4 +435,27 @@ impl LocalSink {
         }
         Ok((records, failed))
     }
+}
+
+/// Check free disk space percentage on a directory (platform-specific)
+#[cfg(unix)]
+pub fn disk_free_percent_dir(dir: &Path) -> Option<u64> {
+    use std::ffi::CString;
+    let c_path = CString::new(dir.to_str()?).ok()?;
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) };
+    if rc != 0 || stat.f_blocks == 0 { return None; }
+    Some((stat.f_bavail as u64 * 100) / stat.f_blocks as u64)
+}
+
+#[cfg(windows)]
+pub fn disk_free_percent_dir(dir: &Path) -> Option<u64> {
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let wide: Vec<u16> = dir.to_str()?.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut free: u64 = 0;
+    let mut total: u64 = 0;
+    let mut _tf: u64 = 0;
+    let ok = unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, &mut _tf) };
+    if ok == 0 || total == 0 { return None; }
+    Some((free * 100) / total)
 }

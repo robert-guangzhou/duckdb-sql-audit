@@ -43,6 +43,17 @@ int32_t sql_audit_conn_reject_add(void);
 // LOW-fix batch (r24): key externalization + NATS confirmation
 int32_t sql_audit_set_key_file(const char* path, int64_t path_len);
 int32_t sql_audit_set_nats_confirm(int32_t on);
+// SECRET six-param surface + disk guard (r30)
+int32_t sql_audit_set_nats_auth(
+    const char* url, int64_t url_len,
+    const char* user, int64_t user_len,
+    const char* password, int64_t password_len,
+    const char* token, int64_t token_len,
+    const char* nkey, int64_t nkey_len,
+    const char* creds, int64_t creds_len,
+    const char* subject, int64_t subject_len);
+int32_t sql_audit_set_disk_free_pct(int64_t pct);
+int64_t sql_audit_get_disk_free_pct(void);
 #ifdef __cplusplus
 }
 #endif

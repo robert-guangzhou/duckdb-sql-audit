@@ -7,12 +7,58 @@
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/main/connection.hpp"
+#include "duckdb/main/database.hpp"
+#include "duckdb/catalog/catalog_transaction.hpp"
+#include "duckdb/main/secret/secret.hpp"
+#include "duckdb/main/secret/secret_manager.hpp"
 #include <atomic>
 #include <cctype>
 #include <cstring>
 #include <functional>
+#include <map>
 
 namespace duckdb {
+
+// === SECRET (sql_audit_nats): nats_rw-compatible six-param surface ===
+static const char *SECRET_TYPE = "sql_audit_nats";
+static const char *const SECRET_OPTIONS[] = {"url", "user", "password", "token", "nkey", "creds", "subject"};
+
+// Credential cache: the CREATE SECRET function stores values here; the
+// sql_audit_nats_secret_name callback applies them. This avoids complex
+// catalog/secret-manager lookups that vary across DuckDB versions.
+static std::map<string, std::map<string, string>> g_secret_cache;
+
+static unique_ptr<BaseSecret> CreateSqlAuditNatsSecret(ClientContext &context, CreateSecretInput &input) {
+    auto secret = make_uniq<KeyValueSecret>(input.scope, input.type, input.provider, input.name);
+    for (auto option : SECRET_OPTIONS) {
+        secret->TrySetValue(option, input);
+    }
+    auto has = [&](const char *option) {
+        Value value;
+        return secret->TryGetValue(Identifier(option), value) && !value.IsNull() && !value.ToString().empty();
+    };
+    int methods = int(has("user") || has("password")) + int(has("token")) + int(has("nkey")) + int(has("creds"));
+    if (methods > 1) {
+        throw InvalidInputException("A sql_audit_nats secret takes one of USER and PASSWORD, TOKEN, NKEY or CREDS");
+    }
+    if (has("user") != has("password")) {
+        throw InvalidInputException("A sql_audit_nats secret takes USER and PASSWORD together");
+    }
+    secret->redact_keys = {"password", "token", "nkey", "creds"};
+    // Cache credential values for the SET sql_audit_nats_secret_name callback
+    // (avoids complex catalog lookups; single-process single-connection model)
+    {
+        std::map<string, string> m;
+        for (auto option : SECRET_OPTIONS) {
+            Value v;
+            if (secret->TryGetValue(Identifier(option), v) && !v.IsNull() && !v.ToString().empty()) {
+                m[option] = v.ToString();
+            }
+        }
+        g_secret_cache[input.name.GetIdentifierName()] = std::move(m);
+    }
+    return std::move(secret);
+}
 
 // Real hook evidence: STRICT option actually set at LOAD, and the number of
 // times our parser_override was invoked by DuckDB (proves the hook fires).
@@ -452,6 +498,33 @@ static void NatsConfirmCallback(ClientContext &ctx, SetScope scope, Value &input
     sql_audit_set_nats_confirm(input.GetValue<bool>() ? 1 : 0);
 }
 
+// SECRET consumption: apply cached credentials by name
+static void NatsSecretCallback(ClientContext &ctx, SetScope scope, Value &input) {
+    auto secret_name = input.ToString();
+    if (secret_name.empty()) return; // unset = fall back to bare URL setting
+    auto it = g_secret_cache.find(secret_name);
+    if (it == g_secret_cache.end()) {
+        throw InvalidInputException("Secret '%s' not found (was it created in this process?)", secret_name);
+    }
+    auto &m = it->second;
+    auto get = [&](const char *k) -> string {
+        auto vit = m.find(k);
+        return vit != m.end() ? vit->second : "";
+    };
+    sql_audit_set_nats_auth(
+        get("url").c_str(), (int64_t)get("url").size(),
+        get("user").c_str(), (int64_t)get("user").size(),
+        get("password").c_str(), (int64_t)get("password").size(),
+        get("token").c_str(), (int64_t)get("token").size(),
+        get("nkey").c_str(), (int64_t)get("nkey").size(),
+        get("creds").c_str(), (int64_t)get("creds").size(),
+        get("subject").c_str(), (int64_t)get("subject").size());
+}
+
+static void DiskFreePctCallback(ClientContext &ctx, SetScope scope, Value &input) {
+    sql_audit_set_disk_free_pct(input.GetValue<int64_t>());
+}
+
 // P4-3: manual re-hook (explicit recovery, mirrors auto-rechain semantics)
 static void RehookFunction(DataChunk &args, ExpressionState &state, Vector &result) {
     auto &ctx = state.GetContext();
@@ -514,6 +587,25 @@ static void LoadInternal(ExtensionLoader &loader) {
     ext.parser_override = AuditOverride;
     callbacks.Register(std::move(ext));
 
+    // Register sql_audit_nats SECRET type (nats_rw-compatible surface)
+    {
+        SecretType secret_type;
+        secret_type.name = SECRET_TYPE;
+        secret_type.deserializer = KeyValueSecret::Deserialize<KeyValueSecret>;
+        secret_type.default_provider = "config";
+        secret_type.extension = "sql_audit";
+        loader.RegisterSecretType(secret_type);
+
+        CreateSecretFunction function;
+        function.secret_type = SECRET_TYPE;
+        function.provider = "config";
+        function.function = CreateSqlAuditNatsSecret;
+        for (auto option : SECRET_OPTIONS) {
+            function.named_parameters[option] = LogicalType(LogicalTypeId::VARCHAR);
+        }
+        loader.RegisterFunction(function);
+    }
+
     // Register settings
     auto &config = DBConfig::GetConfig(db);
     config.AddExtensionOption("sql_audit_path", "Audit output directory",
@@ -536,6 +628,10 @@ static void LoadInternal(ExtensionLoader &loader) {
                               LogicalType::VARCHAR, Value(""), KeyFileCallback, SetScope::GLOBAL);
     config.AddExtensionOption("sql_audit_nats_confirm", "PING/PONG confirmation for every NATS publish",
                               LogicalType::BOOLEAN, Value::BOOLEAN(false), NatsConfirmCallback, SetScope::GLOBAL);
+    config.AddExtensionOption("sql_audit_nats_secret_name", "Name of the sql_audit_nats secret with NATS credentials",
+                              LogicalType::VARCHAR, Value(""), NatsSecretCallback, SetScope::GLOBAL);
+    config.AddExtensionOption("sql_audit_disk_free_pct", "Stop writing when disk free %% below this (0=disabled)",
+                              LogicalType::BIGINT, Value::BIGINT(5), DiskFreePctCallback, SetScope::GLOBAL);
     // internal per-DB hook state (do not SET manually)
     config.AddExtensionOption(SET_DELEGATE_A, "internal: authn delegate", LogicalType::VARCHAR, Value(""), nullptr, SetScope::GLOBAL);
     config.AddExtensionOption(SET_DELEGATE_Z, "internal: authz delegate", LogicalType::VARCHAR, Value(""), nullptr, SetScope::GLOBAL);
