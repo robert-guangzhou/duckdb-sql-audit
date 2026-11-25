@@ -1,9 +1,10 @@
 # duckdb-sql-audit
 
 Full-statement SQL auditing for DuckDB 2.0 — a loadable extension with a
-Rust core: tamper-evident hash-chained local records + NATS publishing, with
-quack-server client attribution (connection records + per-statement
-`conn_id` correlation).
+Rust core: tamper-evident hash-chained local records + NATS publishing
+(via the [nats_rw](https://github.com/robert-guangzhou/duckdb-nats-rw)
+extension), with quack-server client attribution (connection records +
+per-statement `conn_id` correlation).
 
 ## What it does
 
@@ -19,12 +20,14 @@ quack-server client attribution (connection records + per-statement
   client credential), authoritative rejection reason (via quack_oauth's
   audit log), self-reported `sub` (256-byte cap + full hash) and `azp`.
 - **Local sink**: append-only JSONL, size-based rotation, retention
-  (`prune`/`halt`), 0700/0600 permissions, torn-tail recovery on reopen.
-- **NATS sink**: `local`/`nats`/`both`/`off` modes, 5s reconnect cooldown
-  (fail-fast, never stalls the writer), transparent segmentation of oversize
-  payloads (`SQLASEG1` binary frames, server `max_payload` respected),
-  optional per-publish PING/PONG confirmation, periodic chain-head anchors
-  on `<subject>.anchor`.
+  (`prune`/`halt`), disk watermark guard, 0700/0600 permissions, torn-tail
+  recovery on reopen.
+- **NATS publishing via nats_rw** (v2.0): `local`/`nats`/`both`/`off` modes.
+  Publishes through the [nats_rw](https://github.com/robert-guangzhou/duckdb-nats-rw)
+  extension (TLS/mTLS, connection pooling, mature async-nats client).
+  Degraded mode: when NATS is unavailable, audit records automatically fall
+  back to local files (no silent data loss); retries every 30s and recovers
+  automatically. Periodic chain-head anchors on `<subject>.anchor`.
 - **Multi-process safe**: writers take a per-directory flock and rebase onto
   the disk tail — concurrent sessions on one audit dir keep the chain linear.
 - **quack integration**: takes over `quack_authentication_function` /
@@ -72,28 +75,44 @@ SELECT sql_audit_rehook();          -- manual hook recovery
 | `sql_audit_retention_policy` | `prune` | `prune` (delete oldest) or `halt` (stop writing, SQL continues) |
 | `sql_audit_disk_free_pct` | 5 | stop writing when disk free % drops below this (0 = disabled; releases halt when set to 0) |
 | `sql_audit_mode` | `local` | `local` / `nats` / `both` / `off` |
-| `sql_audit_nats_url` | *(empty)* | e.g. `nats://host:4222` |
 | `sql_audit_nats_subject` | `sqlaudit` | record subject; anchors on `<subject>.anchor` |
-| `sql_audit_nats_secret_name` | *(empty)* | name of a `sql_audit_nats` SECRET with credentials (falls back to bare URL) |
-| `sql_audit_nats_confirm` | false | PING/PONG ack per publish |
+| `sql_audit_nats_secret_name` | *(empty)* | name of a `nats_rw` SECRET with credentials |
+| `sql_audit_nats_confirm` | false | PING/PONG ack per publish (via nats_rw's confirm param) |
 | `sql_audit_auto_hook` | true | auto re-take quack hooks when overwritten |
 
-### NATS authentication (SECRET)
+### NATS publishing via nats_rw (v2.0)
 
 ```sql
--- Create credentials (nats_rw-compatible six-param surface, pick ONE auth method)
+-- 1. Install and load nats_rw
+INSTALL nats_rw FROM community;
+LOAD nats_rw;
+
+-- 2. Create an nats_rw secret (URL + credentials)
 CREATE SECRET my_nats (
-    TYPE sql_audit_nats,
+    TYPE nats_rw,
     URL 'nats://localhost:4222',
     TOKEN 'my-token'              -- or: USER 'alice', PASSWORD 's3cret'
-                                 -- or: NKEY 'SU...' (seed)
-                                 -- or: CREDS '/path/to/file.creds' (JWT + seed)
+                                 -- or: NKEY / CREDS / TLS fields
 );
 
--- Apply the secret
+-- 3. Configure sql_audit
+LOAD sql_audit;
 SET sql_audit_nats_secret_name = 'my_nats';
 SET sql_audit_mode = 'both';
+
+-- 4. Execute statements — audit records publish via nats_rw
+SELECT 1;
 ```
+
+### Migration from v1.x
+
+| v1.x | v2.0 |
+|---|---|
+| `CREATE SECRET (TYPE sql_audit_nats, ...)` | `CREATE SECRET (TYPE nats_rw, ...)` |
+| `SET sql_audit_nats_url = '...'` | *(removed — URL lives in the nats_rw secret)* |
+| `SET sql_audit_nats_secret_name = '...'` | *(unchanged — now points to a nats_rw secret)* |
+| Hand-written raw TCP client | nats_rw extension (TLS, pooling, async-nats) |
+| mode=nats publish failure → silent data loss | Degraded mode: local fallback + 30s retry |
 
 ### Record schema (v5)
 

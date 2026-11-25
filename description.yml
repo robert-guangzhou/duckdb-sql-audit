@@ -1,7 +1,7 @@
 extension:
   name: sql_audit
-  description: "Full-statement SQL auditing with a tamper-evident hash chain: HMAC-chained STMT/CONN/SYS records to local rotating JSONL and/or NATS, client attribution via quack hook takeover with faithful delegation and auto-rechain"
-  version: 0.1.0
+  description: "Full-statement SQL auditing with a tamper-evident hash chain: HMAC-chained STMT/CONN/SYS records to local rotating JSONL and/or NATS (published via the nats_rw extension), client attribution via quack hook takeover with faithful delegation and auto-rechain"
+  version: 2.0.0
   language: C++
   build: cmake
   license: BSL 1.1
@@ -30,6 +30,12 @@ docs:
     -- ok | first_bad_seq | total_records | chain_head | window_start_seq
     -- true, 0, 3, <hmac>, 1
 
+    -- NATS publishing (v2.0, requires nats_rw):
+    -- LOAD nats_rw;
+    -- CREATE SECRET my_nats (TYPE nats_rw, URL 'nats://localhost:4222');
+    -- SET sql_audit_nats_secret_name = 'my_nats';
+    -- SET sql_audit_mode = 'both';
+
   extended_description: |
     sql_audit records every statement DuckDB parses (DDL/DML/SELECT/SET/TX/
     EXPLAIN/PRAGMA) via the `parser_override` hook — strictly pass-through,
@@ -48,13 +54,14 @@ docs:
       (hook takeover / rechain events).
     - **Sinks**: local rotating JSONL (size/retention configurable,
       `prune` or `halt` policy, disk watermark guard, 0700/0600
-      permissions, torn-tail recovery) and/or NATS (`local|nats|both|off`),
-      with transparent segmentation of oversize payloads under the server's
-      `max_payload`, a 5s reconnect cooldown that never stalls the writer,
-      optional per-publish PING/PONG confirmation, and periodic chain-head
-      anchor messages for cross-end tamper evidence. NATS auth via
-      `CREATE SECRET (TYPE sql_audit_nats, ...)`: token, user/password,
-      NKey, or JWT/creds file (nats_rw-compatible six-param surface).
+      permissions, torn-tail recovery) and/or NATS (`local|nats|both|off`).
+      v2.0: NATS publishing goes through the nats_rw extension (TLS/mTLS,
+      connection pooling, async-nats). When NATS is unavailable, audit
+      records automatically fall back to local files (Degraded mode, no
+      silent data loss) with 30s retry recovery. Periodic chain-head
+      anchor messages on `<subject>.anchor` for cross-end tamper evidence.
+      Credentials via `CREATE SECRET (TYPE nats_rw, ...)` — the same
+      secret type nats_rw users already know.
     - **Multi-process safe**: writers take a per-directory flock and rebase
       onto the disk tail — concurrent sessions on one audit dir keep the
       chain linear.
