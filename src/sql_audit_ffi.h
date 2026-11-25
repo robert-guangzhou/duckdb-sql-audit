@@ -20,7 +20,6 @@ int32_t sql_audit_set_retention_files(int64_t count);
 int32_t sql_audit_set_retention_policy(int32_t halt);
 int64_t sql_audit_get_file_count(void);
 int32_t sql_audit_get_halted(void);
-int32_t sql_audit_set_nats_url(const char* url, int64_t url_len);
 int32_t sql_audit_set_nats_subject(const char* subject, int64_t subject_len);
 int32_t sql_audit_set_mode(const char* mode, int64_t mode_len);
 int64_t sql_audit_get_nats_published(void);
@@ -43,17 +42,16 @@ int32_t sql_audit_conn_reject_add(void);
 // LOW-fix batch (r24): key externalization + NATS confirmation
 int32_t sql_audit_set_key_file(const char* path, int64_t path_len);
 int32_t sql_audit_set_nats_confirm(int32_t on);
-// SECRET six-param surface + disk guard (r30)
-int32_t sql_audit_set_nats_auth(
-    const char* url, int64_t url_len,
-    const char* user, int64_t user_len,
-    const char* password, int64_t password_len,
-    const char* token, int64_t token_len,
-    const char* nkey, int64_t nkey_len,
-    const char* creds, int64_t creds_len,
-    const char* subject, int64_t subject_len);
 int32_t sql_audit_set_disk_free_pct(int64_t pct);
 int64_t sql_audit_get_disk_free_pct(void);
+// Bridge to nats_rw extension (v2.0)
+int32_t sql_audit_bridge_publish(
+    const char** subjects, const char** payloads, int64_t count,
+    const char* secret_name, int32_t confirm, uint32_t timeout_sec,
+    char* err_buf, int64_t err_len);
+int32_t sql_audit_bridge_probe_function(void);
+int32_t sql_audit_bridge_try_load_nats_rw(void);
+int32_t sql_audit_set_nats_secret_bridge(const char* secret_name, int64_t name_len);
 #ifdef __cplusplus
 }
 #endif

@@ -77,7 +77,7 @@ corrosion_import_crate(
   FLAGS
   --crate-type=staticlib)
 
-set(EXTENSION_SOURCES src/sql_audit_extension.cpp)
+set(EXTENSION_SOURCES src/sql_audit_extension.cpp src/sql_audit_bridge.cpp)
 
 # On MSVC both static and loadable produce .lib and collide - build loadable
 # only (MinGW names differ: lib*_extension.a vs lib*.a, no conflict).

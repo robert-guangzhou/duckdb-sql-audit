@@ -1,6 +1,6 @@
 use crate::chain::{AuditChain, sha256_hex};
 use crate::sink_local::{LocalSink, SinkConfig, RetentionPolicy};
-use crate::sink_nats::{NatsSink, NatsSinkConfig};
+use crate::sink_bridge::BridgeSink;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use crossbeam_channel::Receiver;
@@ -26,15 +26,16 @@ pub struct EngineConfig {
     pub retention_files: usize,
     pub retention_policy: RetentionPolicy,
     pub principal: String,
-    pub nats_url: String,
     pub nats_subject: String,
     pub mode: AuditMode,
     /// Externalized chain key (L1): when set, HMAC key lives OUTSIDE the
     /// audit dir (different mount / vault export). Deployment-time option —
     /// runtime rotation is not supported (old records would stop verifying).
     pub key_file: Option<String>,
-    /// NATS publish confirmation (L3): PING/PONG after every PUB.
+    /// NATS publish confirmation (L3): passed to nats_rw's confirm param.
     pub nats_confirm: bool,
+    /// nats_rw secret name (v2.0: replaces nats_url + six-param auth)
+    pub nats_secret_name: Option<String>,
 }
 
 impl Default for EngineConfig {
@@ -49,10 +50,11 @@ impl Default for EngineConfig {
             max_file_mb: 64, retention_files: 32,
             retention_policy: RetentionPolicy::Prune,
             principal: String::new(),
-            nats_url: String::new(), nats_subject: "sqlaudit.test".to_string(),
+            nats_subject: "sqlaudit.test".to_string(),
             mode: AuditMode::Local,
             key_file: None,
             nats_confirm: false,
+            nats_secret_name: None,
         }
     }
 }
@@ -61,13 +63,11 @@ pub struct AuditEngine {
     config: Arc<Mutex<EngineConfig>>,
     chain: Arc<Mutex<Option<AuditChain>>>,
     sink: Arc<Mutex<Option<LocalSink>>>,
-    nats_sink: Arc<Mutex<Option<NatsSink>>>,
+    nats_sink: Arc<Mutex<Option<BridgeSink>>>,
     record_count: Arc<Mutex<u64>>,
     anchor_counter: Arc<Mutex<u64>>,
     conn_counter: Arc<Mutex<u64>>,
     conn_reject_counter: Arc<Mutex<u64>>,
-    /// NATS auth credentials (set via SECRET, used on reconnect)
-    auth_creds: Arc<Mutex<Option<crate::sink_nats::NatsAuth>>>,
     /// Disk watermark guard: stop writing below this pct free (None=off)
     disk_free_pct: Arc<Mutex<Option<i64>>>,
 }
@@ -87,25 +87,20 @@ impl AuditEngine {
         let chain = new_chain(&config, &dir, resume_seq, resume_prev)?;
         let sink = sink_probe;
         let count = sink.existing_record_count();
-        let nats_sink = if !config.nats_url.is_empty() {
-            match NatsSink::new(NatsSinkConfig {
-                url: config.nats_url.clone(), subject: config.nats_subject.clone(),
-                confirm: config.nats_confirm, ..Default::default()
-            }) {
-                Ok(n) => { eprintln!("sql_audit: NATS connected"); Some(n) }
-                Err(e) => { eprintln!("sql_audit: NATS connect failed: {}", e); None }
-            }
+        // BridgeSink: NATS publishing via nats_rw extension (no direct connection)
+        let bridge_sink = if config.nats_secret_name.is_some() {
+            let sn = config.nats_secret_name.clone().unwrap_or_default();
+            Some(BridgeSink::new(sn, config.nats_confirm))
         } else { None };
         Ok(Self {
             config: Arc::new(Mutex::new(config)),
             chain: Arc::new(Mutex::new(Some(chain))),
             sink: Arc::new(Mutex::new(Some(sink))),
-            nats_sink: Arc::new(Mutex::new(nats_sink)),
+            nats_sink: Arc::new(Mutex::new(bridge_sink)),
             record_count: Arc::new(Mutex::new(count)),
             anchor_counter: Arc::new(Mutex::new(0)),
             conn_counter: Arc::new(Mutex::new(0)),
             conn_reject_counter: Arc::new(Mutex::new(0)),
-            auth_creds: Arc::new(Mutex::new(None)),
             disk_free_pct: Arc::new(Mutex::new(None)),
         })
     }
@@ -116,7 +111,7 @@ impl AuditEngine {
             sink: self.sink.clone(), nats_sink: self.nats_sink.clone(),
             record_count: self.record_count.clone(), anchor_counter: self.anchor_counter.clone(),
             conn_counter: self.conn_counter.clone(), conn_reject_counter: self.conn_reject_counter.clone(),
-            auth_creds: self.auth_creds.clone(), disk_free_pct: self.disk_free_pct.clone(),
+            disk_free_pct: self.disk_free_pct.clone(),
         }
     }
 
@@ -168,14 +163,9 @@ impl AuditEngine {
     pub fn set_retention_policy(&self, p: RetentionPolicy) {
         if let Some(s) = self.sink.lock().unwrap().as_mut() { s.set_retention_policy(p); }
     }
-    pub fn set_nats_url(&self, url: &str) {
-        self.config.lock().unwrap().nats_url = url.to_string();
-        self.reconnect_nats();
-    }
     pub fn set_nats_subject(&self, s: &str) {
-        // The subject is interpolated into the NATS wire line `PUB <subj> <n>`;
-        // whitespace/CRLF would allow protocol injection. Reject and keep the
-        // previous subject.
+        // The subject is used in the bridge SQL; whitespace/CRLF would allow
+        // injection. Reject and keep the previous subject.
         if s.chars().any(|c| c.is_whitespace()) {
             eprintln!("sql_audit: invalid nats subject (whitespace/CRLF rejected): {:?}", s);
             return;
@@ -204,12 +194,12 @@ impl AuditEngine {
         }
     }
 
-    /// NATS publish confirmation (L3): PING/PONG after every PUB.
+    /// NATS publish confirmation (L3): passed to nats_rw's confirm param.
     pub fn set_nats_confirm(&self, on: bool) {
         self.config.lock().unwrap().nats_confirm = on;
-        if let Some(n) = self.nats_sink.lock().unwrap().as_mut() {
-            n.set_confirm(on);
-        }
+        // BridgeSink's confirm is read at publish time from the field —
+        // need &mut to update it; reconnect_bridge recreates with new value
+        self.reconnect_bridge();
     }
     pub fn set_mode(&self, mode: &str) {
         let m = match mode {
@@ -218,20 +208,24 @@ impl AuditEngine {
         };
         let needs_nats = (m == AuditMode::Nats) || (m == AuditMode::Both);
         self.config.lock().unwrap().mode = m;
-        if needs_nats && self.nats_sink.lock().unwrap().is_none() { self.reconnect_nats(); }
+        if needs_nats && self.nats_sink.lock().unwrap().is_none() { self.reconnect_bridge(); }
     }
 
-    fn reconnect_nats(&self) {
-        let (url, subj, confirm) = {
+    /// Set the nats_rw secret name for the bridge (replaces set_nats_auth).
+    pub fn set_nats_secret_bridge(&self, secret_name: &str) -> i32 {
+        self.config.lock().unwrap().nats_secret_name = Some(secret_name.to_string());
+        self.reconnect_bridge();
+        0
+    }
+
+    fn reconnect_bridge(&self) {
+        let (confirm, secret) = {
             let cfg = self.config.lock().unwrap();
-            (cfg.nats_url.clone(), cfg.nats_subject.clone(), cfg.nats_confirm)
+            (cfg.nats_confirm, cfg.nats_secret_name.clone().unwrap_or_default())
         };
-        if url.is_empty() { return; }
-        let auth = self.auth_creds.lock().unwrap().clone();
-        match NatsSink::new(NatsSinkConfig { url, subject: subj, confirm, auth, ..Default::default() }) {
-            Ok(n) => { *self.nats_sink.lock().unwrap() = Some(n); }
-            Err(e) => { eprintln!("sql_audit: NATS reconnect failed: {}", e); *self.nats_sink.lock().unwrap() = None; }
-        }
+        // Drop old bridge sink and create fresh (actual NATS connection
+        // is managed by nats_rw, not by us)
+        *self.nats_sink.lock().unwrap() = Some(BridgeSink::new(secret, confirm));
     }
 
     pub fn nats_published(&self) -> i64 {
@@ -384,7 +378,8 @@ impl AuditEngine {
         if mode == AuditMode::Off { return false; }
 
         if mode == AuditMode::Nats {
-            // nats-only: no local copy, chain advances in memory only
+            // nats-only via bridge: publish through nats_rw; if degraded,
+            // fall back to local file so the record is never silently lost
             let line = {
                 let mut chain_g = self.chain.lock().unwrap();
                 match chain_g.as_mut() {
@@ -396,8 +391,16 @@ impl AuditEngine {
                     None => return false,
                 }
             };
-            let mut nats = self.nats_sink.lock().unwrap();
-            if let Some(n) = nats.as_mut() { n.publish(&subj, &line); }
+            let bridge = self.nats_sink.lock().unwrap();
+            let pub_count = bridge.as_ref()
+                .map(|b| b.publish(&subj, &line))
+                .unwrap_or(false);
+            if !pub_count {
+                // Degraded: write local fallback (fixes A1 silent data loss)
+                let mut sink_g = self.sink.lock().unwrap();
+                if let Some(s) = sink_g.as_mut() { s.append(&line); }
+                *self.record_count.lock().unwrap() += 1;
+            }
             return true;
         }
 
@@ -437,8 +440,8 @@ impl AuditEngine {
         if written {
             *self.record_count.lock().unwrap() += 1;
             if mode == AuditMode::Both {
-                let mut nats = self.nats_sink.lock().unwrap();
-                if let Some(n) = nats.as_mut() { n.publish(&subj, &line); }
+                let bridge = self.nats_sink.lock().unwrap();
+                if let Some(b) = bridge.as_ref() { b.publish(&subj, &line); }
             }
         }
         written
@@ -469,8 +472,8 @@ impl AuditEngine {
                     let head = self.chain.lock().unwrap().as_ref().map(|c| c.chain_head().to_string()).unwrap_or_default();
                     let seq_now = self.chain.lock().unwrap().as_ref().map(|c| c.seq()).unwrap_or(0);
                     let anchor_subject = format!("{}.anchor", subj);
-                    let mut nats = self.nats_sink.lock().unwrap();
-                    if let Some(n) = nats.as_mut() { n.publish_anchor(&anchor_subject, &head, seq_now); }
+                    let bridge = self.nats_sink.lock().unwrap();
+                    if let Some(b) = bridge.as_ref() { b.publish_anchor(&anchor_subject, &head, seq_now); }
                 }
             }
         }
@@ -567,37 +570,6 @@ impl AuditEngine {
 
     pub fn conn_count(&self) -> i64 { *self.conn_counter.lock().unwrap() as i64 }
     pub fn conn_reject_count(&self) -> i64 { *self.conn_reject_counter.lock().unwrap() as i64 }
-
-    /// SECRET six-param auth: build NatsAuth and reconnect.
-    pub fn set_nats_auth(&self, url: &str, user: &str, password: &str,
-                          token: &str, nkey: &str, creds: &str, subject: &str) -> i32 {
-        {
-            let mut cfg = self.config.lock().unwrap();
-            if !url.is_empty() { cfg.nats_url = url.to_string(); }
-            if !subject.is_empty() { cfg.nats_subject = subject.to_string(); }
-        }
-        let auth = if !token.is_empty() {
-            Some(crate::sink_nats::NatsAuth::Token(token.to_string()))
-        } else if !user.is_empty() && !password.is_empty() {
-            Some(crate::sink_nats::NatsAuth::UserPass {
-                user: user.to_string(), pass: password.to_string(),
-            })
-        } else if !nkey.is_empty() {
-            Some(crate::sink_nats::NatsAuth::NKey { seed: nkey.to_string() })
-        } else if !creds.is_empty() {
-            match parse_creds_file(creds) {
-                Ok((jwt, seed)) => Some(crate::sink_nats::NatsAuth::Creds { jwt, seed }),
-                Err(e) => { eprintln!("sql_audit: creds parse: {}", e); return -1; }
-            }
-        } else {
-            None
-        };
-        *self.auth_creds.lock().unwrap() = auth;
-        // Credential change: drop old sink (bypasses cooldown) and reconnect now
-        *self.nats_sink.lock().unwrap() = None;
-        self.reconnect_nats();
-        0
-    }
 
     /// Disk watermark guard threshold (0 = disabled)
     pub fn set_disk_free_pct(&self, pct: i64) {

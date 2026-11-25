@@ -1,17 +1,17 @@
 // sql_audit: Rust core engine
-// Phase 3: + NATS mode
+// v2.0: NATS publishing via nats_rw bridge (replaces raw TCP client)
 
 #![allow(non_camel_case_types)]
 
 mod engine;
 mod chain;
 mod sink_local;
-mod sink_nats;
+mod sink_bridge;
 
 pub use chain::{AuditChain, ChainKey};
 pub use engine::{AuditEngine, EngineConfig};
 pub use sink_local::{LocalSink, SinkConfig, RetentionPolicy};
-pub use sink_nats::{NatsSink, NatsSinkConfig};
+pub use sink_bridge::BridgeSink;
 
 use std::sync::atomic::{AtomicI64, AtomicBool, Ordering};
 use std::sync::OnceLock;
@@ -123,15 +123,7 @@ pub extern "C" fn sql_audit_set_retention_policy(halt: i32) -> i32 {
     } else { -1 }
 }
 
-// Phase 3: NATS config
-#[no_mangle]
-pub extern "C" fn sql_audit_set_nats_url(url: *const u8, url_len: i64) -> i32 {
-    let url_str = unsafe {
-        std::str::from_utf8_unchecked(std::slice::from_raw_parts(url, url_len as usize))
-    };
-    if let Some(eng) = ENGINE.get() { eng.set_nats_url(url_str); 0 } else { -1 }
-}
-
+// v2.0: NATS config (bridge mode — no direct URL, use nats_rw secret)
 #[no_mangle]
 pub extern "C" fn sql_audit_set_nats_subject(subject: *const u8, subject_len: i64) -> i32 {
     let subj_str = unsafe {
@@ -276,29 +268,15 @@ pub extern "C" fn sql_audit_set_nats_confirm(on: i32) -> i32 {
     if let Some(eng) = ENGINE.get() { eng.set_nats_confirm(on != 0); 0 } else { -1 }
 }
 
-
-// SECRET six-param surface + disk guard (r30)
+// v2.0: bridge secret name (replaces six-param auth)
 #[no_mangle]
-pub extern "C" fn sql_audit_set_nats_auth(
-    url: *const u8, url_len: i64,
-    user: *const u8, user_len: i64,
-    password: *const u8, password_len: i64,
-    token: *const u8, token_len: i64,
-    nkey: *const u8, nkey_len: i64,
-    creds: *const u8, creds_len: i64,
-    subject: *const u8, subject_len: i64,
-) -> i32 {
+pub extern "C" fn sql_audit_set_nats_secret_bridge(secret_name: *const u8, name_len: i64) -> i32 {
     let result = std::panic::catch_unwind(|| {
-        let eng = match ENGINE.get() { Some(e) => e, None => return -1 };
-        let s = |p: *const u8, l: i64| unsafe {
-            if p.is_null() || l == 0 { String::new() }
-            else { std::str::from_utf8_unchecked(std::slice::from_raw_parts(p, l as usize)).to_string() }
+        let sn = unsafe {
+            if secret_name.is_null() || name_len == 0 { String::new() }
+            else { std::str::from_utf8_unchecked(std::slice::from_raw_parts(secret_name, name_len as usize)).to_string() }
         };
-        eng.set_nats_auth(
-            &s(url, url_len), &s(user, user_len), &s(password, password_len),
-            &s(token, token_len), &s(nkey, nkey_len), &s(creds, creds_len),
-            &s(subject, subject_len),
-        )
+        if let Some(eng) = ENGINE.get() { eng.set_nats_secret_bridge(&sn) } else { -1 }
     });
     match result { Ok(r) => r, Err(_) => -1 }
 }

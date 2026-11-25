@@ -19,46 +19,8 @@
 
 namespace duckdb {
 
-// === SECRET (sql_audit_nats): nats_rw-compatible six-param surface ===
-static const char *SECRET_TYPE = "sql_audit_nats";
-static const char *const SECRET_OPTIONS[] = {"url", "user", "password", "token", "nkey", "creds", "subject"};
-
-// Credential cache: the CREATE SECRET function stores values here; the
-// sql_audit_nats_secret_name callback applies them. This avoids complex
-// catalog/secret-manager lookups that vary across DuckDB versions.
-static std::map<string, std::map<string, string>> g_secret_cache;
-
-static unique_ptr<BaseSecret> CreateSqlAuditNatsSecret(ClientContext &context, CreateSecretInput &input) {
-    auto secret = make_uniq<KeyValueSecret>(input.scope, input.type, input.provider, input.name);
-    for (auto option : SECRET_OPTIONS) {
-        secret->TrySetValue(option, input);
-    }
-    auto has = [&](const char *option) {
-        Value value;
-        return secret->TryGetValue(Identifier(option), value) && !value.IsNull() && !value.ToString().empty();
-    };
-    int methods = int(has("user") || has("password")) + int(has("token")) + int(has("nkey")) + int(has("creds"));
-    if (methods > 1) {
-        throw InvalidInputException("A sql_audit_nats secret takes one of USER and PASSWORD, TOKEN, NKEY or CREDS");
-    }
-    if (has("user") != has("password")) {
-        throw InvalidInputException("A sql_audit_nats secret takes USER and PASSWORD together");
-    }
-    secret->redact_keys = {"password", "token", "nkey", "creds"};
-    // Cache credential values for the SET sql_audit_nats_secret_name callback
-    // (avoids complex catalog lookups; single-process single-connection model)
-    {
-        std::map<string, string> m;
-        for (auto option : SECRET_OPTIONS) {
-            Value v;
-            if (secret->TryGetValue(Identifier(option), v) && !v.IsNull() && !v.ToString().empty()) {
-                m[option] = v.ToString();
-            }
-        }
-        g_secret_cache[input.name.GetIdentifierName()] = std::move(m);
-    }
-    return std::move(secret);
-}
+// v2.0: Old sql_audit_nats SECRET type removed — replaced by nats_rw's SECRET.
+// The sql_audit_nats_secret_name setting now points to an nats_rw secret.
 
 // Real hook evidence: STRICT option actually set at LOAD, and the number of
 // times our parser_override was invoked by DuckDB (proves the hook fires).
@@ -221,9 +183,12 @@ static inline bool DispatchPrefixAt(const char *s, size_t n, size_t pos,
     }
     return true;
 }
+// Bridge guard: prevents auditing the bridge's own SQL (recursion)
+bool IsInBridge();
 static ParserOverrideResult AuditOverride(ParserExtensionInfo *, const string &query, ParserOptions &) {
     g_override_calls.fetch_add(1, std::memory_order_relaxed);
     if (g_in_chain) return ParserOverrideResult();
+    if (IsInBridge()) return ParserOverrideResult();
     const char *s = query.c_str();
     size_t n = query.size();
     size_t lead = 0;
@@ -475,10 +440,6 @@ static void RetentionPolicyCallback(ClientContext &ctx, SetScope scope, Value &i
     int halt = (policy == "halt") ? 1 : 0;
     sql_audit_set_retention_policy(halt);
 }
-static void NatsUrlCallback(ClientContext &ctx, SetScope scope, Value &input) {
-    auto url = input.ToString();
-    sql_audit_set_nats_url(url.c_str(), (int64_t)url.size());
-}
 static void NatsSubjectCallback(ClientContext &ctx, SetScope scope, Value &input) {
     auto subj = input.ToString();
     sql_audit_set_nats_subject(subj.c_str(), (int64_t)subj.size());
@@ -497,28 +458,12 @@ static void KeyFileCallback(ClientContext &ctx, SetScope scope, Value &input) {
 static void NatsConfirmCallback(ClientContext &ctx, SetScope scope, Value &input) {
     sql_audit_set_nats_confirm(input.GetValue<bool>() ? 1 : 0);
 }
-
-// SECRET consumption: apply cached credentials by name
+// v2.0: secret_name now points to a nats_rw secret (not our own type)
 static void NatsSecretCallback(ClientContext &ctx, SetScope scope, Value &input) {
     auto secret_name = input.ToString();
-    if (secret_name.empty()) return; // unset = fall back to bare URL setting
-    auto it = g_secret_cache.find(secret_name);
-    if (it == g_secret_cache.end()) {
-        throw InvalidInputException("Secret '%s' not found (was it created in this process?)", secret_name);
-    }
-    auto &m = it->second;
-    auto get = [&](const char *k) -> string {
-        auto vit = m.find(k);
-        return vit != m.end() ? vit->second : "";
-    };
-    sql_audit_set_nats_auth(
-        get("url").c_str(), (int64_t)get("url").size(),
-        get("user").c_str(), (int64_t)get("user").size(),
-        get("password").c_str(), (int64_t)get("password").size(),
-        get("token").c_str(), (int64_t)get("token").size(),
-        get("nkey").c_str(), (int64_t)get("nkey").size(),
-        get("creds").c_str(), (int64_t)get("creds").size(),
-        get("subject").c_str(), (int64_t)get("subject").size());
+    if (secret_name.empty()) return;
+    // Notify Rust to update the bridge's secret_name
+    sql_audit_set_nats_secret_bridge(secret_name.c_str(), (int64_t)secret_name.size());
 }
 
 static void DiskFreePctCallback(ClientContext &ctx, SetScope scope, Value &input) {
@@ -552,9 +497,14 @@ static void RehookFunction(DataChunk &args, ExpressionState &state, Vector &resu
 }
 
 // === Load ===
+// Bridge database setter (implemented in sql_audit_bridge.cpp)
+void SetBridgeDatabase(DatabaseInstance *db);
+
 static void LoadInternal(ExtensionLoader &loader) {
     auto &db = loader.GetDatabaseInstance();
     sql_audit_init();
+    // Capture DatabaseInstance for the NATS bridge layer
+    SetBridgeDatabase(&db);
 
     // Register table functions
     TableFunction health_fn("sql_audit_health", {}, HealthFn, HealthBind, HealthInit);
@@ -587,25 +537,6 @@ static void LoadInternal(ExtensionLoader &loader) {
     ext.parser_override = AuditOverride;
     callbacks.Register(std::move(ext));
 
-    // Register sql_audit_nats SECRET type (nats_rw-compatible surface)
-    {
-        SecretType secret_type;
-        secret_type.name = SECRET_TYPE;
-        secret_type.deserializer = KeyValueSecret::Deserialize<KeyValueSecret>;
-        secret_type.default_provider = "config";
-        secret_type.extension = "sql_audit";
-        loader.RegisterSecretType(secret_type);
-
-        CreateSecretFunction function;
-        function.secret_type = SECRET_TYPE;
-        function.provider = "config";
-        function.function = CreateSqlAuditNatsSecret;
-        for (auto option : SECRET_OPTIONS) {
-            function.named_parameters[option] = LogicalType(LogicalTypeId::VARCHAR);
-        }
-        loader.RegisterFunction(function);
-    }
-
     // Register settings
     auto &config = DBConfig::GetConfig(db);
     config.AddExtensionOption("sql_audit_path", "Audit output directory",
@@ -616,8 +547,6 @@ static void LoadInternal(ExtensionLoader &loader) {
                               LogicalType::BIGINT, Value::BIGINT(32), RetentionFilesCallback, SetScope::GLOBAL);
     config.AddExtensionOption("sql_audit_retention_policy", "Retention: prune or halt",
                               LogicalType::VARCHAR, Value("prune"), RetentionPolicyCallback, SetScope::GLOBAL);
-    config.AddExtensionOption("sql_audit_nats_url", "NATS server URL",
-                              LogicalType::VARCHAR, Value(""), NatsUrlCallback, SetScope::GLOBAL);
     config.AddExtensionOption("sql_audit_nats_subject", "NATS subject",
                               LogicalType::VARCHAR, Value("sqlaudit"), NatsSubjectCallback, SetScope::GLOBAL);
     config.AddExtensionOption("sql_audit_mode", "Mode: local/nats/both/off",

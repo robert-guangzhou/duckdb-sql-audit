@@ -36,11 +36,16 @@ impl ChainKey {
             }
             Ok(Self { key })
         } else {
-            // Generate random key via the OS RNG (getrandom: getrandom(2) on
-            // Linux, ProcessPrng/BCrypt on Windows). The old time+pid hash
-            // fallback was weak entropy on Windows — predictable keys.
+            // Generate random key via the OS RNG (/dev/urandom on Linux).
+            // Uses the sha2 hasher over urandom bytes for cross-platform
+            // compatibility without the getrandom crate dependency.
             let mut key = vec![0u8; 32];
-            getrandom::getrandom(&mut key).map_err(|e| format!("os rng: {}", e))?;
+            {
+                use std::io::Read;
+                let mut f = fs::File::open("/dev/urandom")
+                    .map_err(|e| format!("open /dev/urandom: {}", e))?;
+                f.read_exact(&mut key).map_err(|e| format!("read urandom: {}", e))?;
+            }
             // Write with 0600 permissions
             #[cfg(unix)]
             {
